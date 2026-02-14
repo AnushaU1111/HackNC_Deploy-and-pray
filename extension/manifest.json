@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Sycophancy Shield",
+  "version": "1.0",
+  "description": "Flags deceptive or sycophantic AI behavior locally.",
+  "permissions": ["activeTab"],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*"
+      ],
+      "js": ["content.js"]
+    }
+  ]
+}
