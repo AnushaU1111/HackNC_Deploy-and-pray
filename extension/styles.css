@@ -1,0 +1,28 @@
+.shield-alert {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    z-index: 10000;
+    padding: 20px;
+    border-radius: 12px;
+    width: 300px;
+    font-family: sans-serif;
+    color: white;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    transition: opacity 0.6s ease;
+}
+
+.danger {
+    background: #e74c3c;
+    border-left: 8px solid #c0392b;
+}
+
+.caution {
+    background: #f39c12;
+    border-left: 8px solid #d35400;
+}
+
+.safe {
+    background: #2ecc71;
+    border-left: 8px solid #27ae60;
+}
