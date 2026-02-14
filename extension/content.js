@@ -1,18 +1,17 @@
-// Function to send data to Person 2's Backend
-const analyzeChat = async (userText, aiText) => {
-    console.log("Shield: Sending for analysis...");
-    try {
-        const response = await fetch('http://localhost:5000/analyze', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user: userText, ai: aiText })
-        });
-        const data = await response.json();
-        // Signal Person 1's UI script to show the alert
-        window.dispatchEvent(new CustomEvent('shield_result', { detail: JSON.stringify(data) }));
-    } catch (err) {
-        console.error("Shield Backend Offline. Is Person 2's server running?");
-    }
+const analyzeChat = (userText, aiText) => {
+    console.log("Shield: Asking Background Script to analyze...");
+
+    chrome.runtime.sendMessage({
+        type: "ANALYZE_TEXT",
+        payload: { user: userText, ai: aiText }
+    }, (response) => {
+        if (response && response.success) {
+            console.log("Shield: Received result:", response.data);
+            window.dispatchEvent(new CustomEvent('shield_result', { detail: JSON.stringify(response.data) }));
+        } else {
+            console.error("Shield: Backend error:", response?.error);
+        }
+    });
 };
 
 // Observer to detect new messages
