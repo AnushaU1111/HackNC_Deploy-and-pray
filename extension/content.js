@@ -317,23 +317,43 @@ function generatePromptFromSuggestion(suggestion) {
 
 function insertPromptToInput(text) {
   const promptText = String(text || "");
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+
   // Try common selectors: textarea, input[type=text], contenteditable divs
   const trySetValue = (el, value) => {
     try {
       if (!el) return false;
+      if (!isVisible(el)) return false;
+
       if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        if (el.disabled || el.readOnly) return false;
         el.focus();
         el.value = value;
         el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
       }
       if (el.isContentEditable) {
         el.focus();
-        // set text content
-        el.innerText = value;
+
+        // set text content with selection-safe replace
+        if (typeof document.execCommand === 'function') {
+          document.execCommand('selectAll', false, null);
+          document.execCommand('insertText', false, value);
+        } else {
+          el.innerText = value;
+        }
+
         // dispatch input and keyup to notify React-like frameworks
-        el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
         el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
       }
     } catch (e) {
@@ -342,8 +362,15 @@ function insertPromptToInput(text) {
     return false;
   };
 
-  // Common selectors used by chat UIs
+  // Priority selectors (ChatGPT first)
   const selectors = [
+    '#prompt-textarea',
+    'textarea#prompt-textarea',
+    'div#prompt-textarea[contenteditable="true"]',
+    'div[contenteditable="true"][id="prompt-textarea"]',
+    'div[role="textbox"][contenteditable="true"][id="prompt-textarea"]',
+    'form textarea',
+    'form div[role="textbox"][contenteditable="true"]',
     'textarea[placeholder]','textarea',
     'input[placeholder]','input[type=text]',
     'div[role="textbox"][contenteditable="true"]',
@@ -504,6 +531,18 @@ let currentTab = "shield";
 let latestShieldResult = { sycophancy: 0, concessive: 0, emotional: 0, pii: 0 };
 let latestFactResult = null;
 let factCheckLoading = false;
+let latestUserText = "";
+let latestAssistantText = "";
+let latestScores = { sycophancy: 0, concessive: 0, emotional: 0, pii: 0 };
+const rejectedPromptsByPair = new Map();
+
+function normalizePromptText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function injectPanel(result) {
   if (result) {
@@ -643,10 +682,54 @@ function injectPanel(result) {
 
   if (denyBtn) {
     denyBtn.addEventListener('click', () => {
-      // simply remove the suggestion area
-      if (promptEl) promptEl.textContent = '';
-      denyBtn.textContent = 'Dismissed';
-      setTimeout(() => (denyBtn.textContent = 'Deny'), 800);
+      const currentPrompt = (promptEl?.innerText || promptEl?.textContent || '').trim();
+      if (!currentPrompt || !latestUserText || !latestAssistantText || !activePairKey) {
+        if (promptEl) promptEl.textContent = '';
+        denyBtn.textContent = 'Dismissed';
+        setTimeout(() => (denyBtn.textContent = 'Deny'), 800);
+        return;
+      }
+
+      const currentRejected = rejectedPromptsByPair.get(activePairKey) || [];
+      const normalizedRejected = new Set(currentRejected.map(normalizePromptText));
+      const normalizedCurrent = normalizePromptText(currentPrompt);
+      if (normalizedCurrent && !normalizedRejected.has(normalizedCurrent)) {
+        currentRejected.push(currentPrompt);
+        rejectedPromptsByPair.set(activePairKey, currentRejected.slice(-5));
+      }
+
+      denyBtn.disabled = true;
+      denyBtn.textContent = 'Generating...';
+
+      sendToBackend(
+        latestUserText,
+        latestAssistantText,
+        latestScores,
+        (backendData) => {
+          denyBtn.disabled = false;
+          denyBtn.textContent = 'Deny';
+
+          const candidate = generatePromptFromSuggestion(backendData?.better_prompt || '').trim();
+          const normalizedCandidate = normalizePromptText(candidate);
+          const rejectedList = rejectedPromptsByPair.get(activePairKey) || [];
+          const rejectedSet = new Set(rejectedList.map(normalizePromptText));
+
+          if (!candidate || !normalizedCandidate || rejectedSet.has(normalizedCandidate)) {
+            denyBtn.textContent = 'No Alternative';
+            setTimeout(() => (denyBtn.textContent = 'Deny'), 1200);
+            return;
+          }
+
+          injectPanel({
+            ...latestShieldResult,
+            betterPrompt: candidate
+          });
+        },
+        {
+          retry: true,
+          rejectedPrompts: rejectedPromptsByPair.get(activePairKey) || []
+        }
+      );
     });
   }
 }
@@ -659,7 +742,7 @@ function ensurePanelMounted() {
 }
 
 // ====== BACKEND INTEGRATION ======
-function sendToBackend(userText, assistantText, scores, callback) {
+function sendToBackend(userText, assistantText, scores, callback, options = {}) {
   // Send to backend via background script
   chrome.runtime.sendMessage(
     {
@@ -672,7 +755,9 @@ function sendToBackend(userText, assistantText, scores, callback) {
           concessive: Number(scores.concessive),
           emotional: Number(scores.emotional),
           pii: Number(scores.pii)
-        }
+        },
+        retry: Boolean(options.retry),
+        rejected_prompts: Array.isArray(options.rejectedPrompts) ? options.rejectedPrompts : []
       }
     },
     (response) => {
@@ -718,14 +803,46 @@ function sendFactCheckToBackend(userText, assistantText, callback) {
 // ====== OBSERVER FOR REAL-TIME UPDATES ======
 const chatContainer = document.querySelector("main") || document.body;
 let lastProcessedPair = "";
+let activePairKey = "";
+let pendingPairKey = "";
+let pendingPairSince = 0;
+let inFlightShieldKey = "";
+let inFlightFactKey = "";
+
+function isAssistantStillStreaming() {
+  return Boolean(
+    document.querySelector(".result-streaming") ||
+    document.querySelector("[data-testid='conversation-turn-loading']") ||
+    document.querySelector("[aria-label='Stop generating']")
+  );
+}
 
 function processLatestConversation(force = false) {
   const msgs = getMessages();
   if (!msgs) return;
 
+  if (!force && isAssistantStillStreaming()) return;
+
   const pairKey = `${msgs.user}\n---\n${msgs.assistant}`;
+
+  if (!force) {
+    if (pairKey !== pendingPairKey) {
+      pendingPairKey = pairKey;
+      pendingPairSince = Date.now();
+      return;
+    }
+
+    if (Date.now() - pendingPairSince < 900) {
+      return;
+    }
+  } else {
+    pendingPairKey = pairKey;
+    pendingPairSince = Date.now();
+  }
+
   if (!force && pairKey === lastProcessedPair) return;
   lastProcessedPair = pairKey;
+  activePairKey = pairKey;
 
   let result;
   try {
@@ -736,31 +853,53 @@ function processLatestConversation(force = false) {
   }
 
   injectPanel(result);
+  latestUserText = msgs.user;
+  latestAssistantText = msgs.assistant;
+  latestScores = result;
 
   factCheckLoading = true;
   if (currentTab === "fact") injectPanel();
 
   try {
-    sendToBackend(msgs.user, msgs.assistant, result, (backendData) => {
-      if (!backendData) return;
-      if (backendData.better_prompt) {
-        injectPanel({
-          ...result,
-          betterPrompt: backendData.better_prompt
-        });
-      }
-    });
+    if (inFlightShieldKey !== pairKey) {
+      inFlightShieldKey = pairKey;
+
+      sendToBackend(msgs.user, msgs.assistant, result, (backendData) => {
+        if (inFlightShieldKey === pairKey) {
+          inFlightShieldKey = "";
+        }
+        if (activePairKey !== pairKey) return;
+        if (!backendData) return;
+        if (backendData.better_prompt) {
+          injectPanel({
+            ...result,
+            betterPrompt: backendData.better_prompt
+          });
+        }
+      }, {
+        retry: false,
+        rejectedPrompts: rejectedPromptsByPair.get(pairKey) || []
+      });
+    }
   } catch (e) {
     console.error('[Sycophancy] sendToBackend error:', e);
   }
 
   try {
-    sendFactCheckToBackend(msgs.user, msgs.assistant, (factData) => {
-      if (!factData) return;
-      latestFactResult = factData;
-      factCheckLoading = false;
-      injectPanel();
-    });
+    if (inFlightFactKey !== pairKey) {
+      inFlightFactKey = pairKey;
+
+      sendFactCheckToBackend(msgs.user, msgs.assistant, (factData) => {
+        if (inFlightFactKey === pairKey) {
+          inFlightFactKey = "";
+        }
+        if (activePairKey !== pairKey) return;
+        if (!factData) return;
+        latestFactResult = factData;
+        factCheckLoading = false;
+        injectPanel();
+      });
+    }
   } catch (e) {
     factCheckLoading = false;
     console.error('[Sycophancy] factcheck error:', e);

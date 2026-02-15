@@ -25,6 +25,8 @@ class AnalyzeRequest(BaseModel):
     user: str
     ai: str
     scores: Optional[dict] = None
+    retry: Optional[bool] = False
+    rejected_prompts: Optional[list[str]] = None
 
 
 class FactCheckRequest(BaseModel):
@@ -47,7 +49,7 @@ def fallback_prompt(user_text: str, sycophancy: float, pii: float) -> str:
     )
 
 
-def build_backboard_messages(user_text: str, assistant_text: str, sycophancy: float, pii: float) -> list[dict]:
+def build_backboard_messages(user_text: str, assistant_text: str, sycophancy: float, pii: float, rejected_prompts: Optional[list[str]] = None) -> list[dict]:
     system_prompt = (
         "You are a prompt optimization specialist for AI safety. "
         "Generate exactly one optimized user prompt only. "
@@ -63,17 +65,25 @@ def build_backboard_messages(user_text: str, assistant_text: str, sycophancy: fl
         "Generate one optimized user prompt that will steer the next assistant response to be neutral, factual, and non-sycophantic.\n"
         "Remember: output format must be exactly 'OPTIMIZED_PROMPT: ...'"
     )
+    if rejected_prompts:
+        formatted_rejected = "\n".join([f"- {prompt}" for prompt in rejected_prompts[-5:] if prompt and prompt.strip()])
+        if formatted_rejected:
+            user_prompt += (
+                "\nPreviously rejected prompts (do not repeat or closely paraphrase these):\n"
+                f"{formatted_rejected}\n"
+                "Generate a meaningfully different optimized prompt."
+            )
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
 
-def _generate_with_openai_compat(client: httpx.Client, api_url: str, api_key: str, model: str, user_text: str, assistant_text: str, sycophancy: float, pii: float) -> Optional[str]:
+def _generate_with_openai_compat(client: httpx.Client, api_url: str, api_key: str, model: str, user_text: str, assistant_text: str, sycophancy: float, pii: float, rejected_prompts: Optional[list[str]] = None) -> Optional[str]:
     endpoint = f"{api_url.rstrip('/')}/chat/completions"
     payload = {
         "model": model,
-        "messages": build_backboard_messages(user_text, assistant_text, sycophancy, pii),
+        "messages": build_backboard_messages(user_text, assistant_text, sycophancy, pii, rejected_prompts),
         "temperature": 0.2,
     }
     headers = {
@@ -86,7 +96,7 @@ def _generate_with_openai_compat(client: httpx.Client, api_url: str, api_key: st
     return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or None
 
 
-def _generate_with_backboard_native(client: httpx.Client, api_url: str, api_key: str, model: str, user_text: str, assistant_text: str, sycophancy: float, pii: float) -> Optional[str]:
+def _generate_with_backboard_native(client: httpx.Client, api_url: str, api_key: str, model: str, user_text: str, assistant_text: str, sycophancy: float, pii: float, rejected_prompts: Optional[list[str]] = None) -> Optional[str]:
     base_url = api_url.rstrip("/")
     headers = {"X-API-Key": api_key}
 
@@ -104,6 +114,14 @@ def _generate_with_backboard_native(client: httpx.Client, api_url: str, api_key:
         "Generate one optimized user prompt that reduces sycophancy and PII risk.\n"
         "Remember: output format must be exactly 'OPTIMIZED_PROMPT: ...'"
     )
+    if rejected_prompts:
+        formatted_rejected = "\n".join([f"- {prompt}" for prompt in rejected_prompts[-5:] if prompt and prompt.strip()])
+        if formatted_rejected:
+            user_prompt += (
+                "\nPreviously rejected prompts (do not repeat or closely paraphrase these):\n"
+                f"{formatted_rejected}\n"
+                "Generate a meaningfully different optimized prompt."
+            )
 
     assistant_resp = client.post(
         f"{base_url}/assistants",
@@ -182,7 +200,31 @@ def sanitize_optimized_prompt(raw_text: str) -> Optional[str]:
     return cleaned
 
 
-def generate_better_prompt(user_text: str, assistant_text: str, sycophancy: float, pii: float) -> tuple[str, str]:
+def _normalize_prompt_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", (value or "").lower())).strip()
+
+
+def _is_rejected_prompt(candidate: str, rejected_prompts: Optional[list[str]]) -> bool:
+    if not candidate or not rejected_prompts:
+        return False
+
+    normalized_candidate = _normalize_prompt_text(candidate)
+    if not normalized_candidate:
+        return False
+
+    for rejected in rejected_prompts:
+        normalized_rejected = _normalize_prompt_text(rejected or "")
+        if not normalized_rejected:
+            continue
+        if normalized_candidate == normalized_rejected:
+            return True
+        if normalized_candidate in normalized_rejected or normalized_rejected in normalized_candidate:
+            return True
+
+    return False
+
+
+def generate_better_prompt(user_text: str, assistant_text: str, sycophancy: float, pii: float, rejected_prompts: Optional[list[str]] = None) -> tuple[str, str]:
     api_url = os.getenv("BACKBOARD_API_URL", "").strip()
     api_key = os.getenv("BACKBOARD_API_KEY", "").strip()
     model = os.getenv("BACKBOARD_MODEL", "gpt-4o-mini")
@@ -195,29 +237,36 @@ def generate_better_prompt(user_text: str, assistant_text: str, sycophancy: floa
         with httpx.Client(timeout=25.0) as client:
             if mode in ("auto", "openai"):
                 try:
-                    content = _generate_with_openai_compat(
-                        client, api_url, api_key, model, user_text, assistant_text, sycophancy, pii
-                    )
-                    if content:
+                    for _ in range(3):
+                        content = _generate_with_openai_compat(
+                            client, api_url, api_key, model, user_text, assistant_text, sycophancy, pii, rejected_prompts
+                        )
+                        if not content:
+                            continue
                         cleaned = sanitize_optimized_prompt(content)
-                        if cleaned:
+                        if cleaned and not _is_rejected_prompt(cleaned, rejected_prompts):
                             return cleaned, "backboard-openai"
                 except Exception:
                     if mode == "openai":
                         raise
 
             if mode in ("auto", "native"):
-                content = _generate_with_backboard_native(
-                    client, api_url, api_key, model, user_text, assistant_text, sycophancy, pii
-                )
-                if content:
+                for _ in range(3):
+                    content = _generate_with_backboard_native(
+                        client, api_url, api_key, model, user_text, assistant_text, sycophancy, pii, rejected_prompts
+                    )
+                    if not content:
+                        continue
                     cleaned = sanitize_optimized_prompt(content)
-                    if cleaned:
+                    if cleaned and not _is_rejected_prompt(cleaned, rejected_prompts):
                         return cleaned, "backboard-native"
     except Exception:
         pass
 
-    return fallback_prompt(user_text, sycophancy, pii), "fallback"
+    fallback = fallback_prompt(user_text, sycophancy, pii)
+    if _is_rejected_prompt(fallback, rejected_prompts):
+        fallback = f"{fallback} Structure your answer in 3 concise bullet points and include one uncertainty check."
+    return fallback, "fallback"
 
 
 def build_factcheck_messages(user_text: str, assistant_text: str) -> list[dict]:
@@ -421,7 +470,13 @@ def analyze(request: AnalyzeRequest):
     if flagged:
         response["question"] = request.user
         response["answer"] = request.ai
-        better_prompt, source = generate_better_prompt(request.user, request.ai, sycophancy, pii)
+        better_prompt, source = generate_better_prompt(
+            request.user,
+            request.ai,
+            sycophancy,
+            pii,
+            request.rejected_prompts or []
+        )
         response["better_prompt"] = better_prompt
         response["prompt_source"] = source
 
