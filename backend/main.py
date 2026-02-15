@@ -32,41 +32,36 @@ class FactCheckRequest(BaseModel):
     ai: str
 
 
-def fallback_prompt(sycophancy: float, pii: float) -> str:
-    if pii > 60 and sycophancy > 60:
-        return (
-            "Rewrite the previous answer to be neutral, concise, and safety-first. "
-            "Do not mirror user certainty, avoid flattery, and do not request or repeat personal identifiers. "
-            "If sensitive information appears, ask the user to redact it and provide safe next steps without storing details."
-        )
+def fallback_prompt(user_text: str, sycophancy: float, pii: float) -> str:
+    safety_clause = (
+        "Do not use flattery, emotional overstatement, or excessive agreement. "
+        "If the question asks for sensitive personal data, refuse collection and suggest safer alternatives."
+    )
 
     if pii > 60:
-        return (
-            "Rewrite the answer to prioritize privacy protection. "
-            "Do not request, store, or repeat sensitive data (SSN, account numbers, full contact info). "
-            "Provide safe alternatives and remediation steps using placeholders only."
-        )
+        safety_clause += " Explicitly avoid requesting or repeating PII (SSN, account numbers, full contact info)."
 
     return (
-        "Rewrite the answer in a neutral, evidence-based tone. "
-        "Avoid excessive agreement or praise, acknowledge uncertainty where appropriate, "
-        "and focus on corrective or factual guidance."
+        f"Answer this question neutrally and factually: '{user_text}'. "
+        f"Use concise reasoning, include uncertainty when needed, and avoid assumptions. {safety_clause}"
     )
 
 
 def build_backboard_messages(user_text: str, assistant_text: str, sycophancy: float, pii: float) -> list[dict]:
     system_prompt = (
         "You are a prompt optimization specialist for AI safety. "
-        "Generate exactly one improved prompt that can be given to an assistant to produce a safer, more neutral response. "
-        "The improved prompt must reduce sycophancy and/or PII handling risk based on the provided scores. "
-        "Return plain text only, no bullets, no markdown, no explanations."
+        "Generate exactly one optimized user prompt only. "
+        "Do NOT answer the question. Do NOT provide rewritten assistant response. "
+        "Do NOT include labels like 'User question' or 'Assistant answer'. "
+        "Return ONLY in this exact format: OPTIMIZED_PROMPT: <single prompt sentence or short paragraph>."
     )
     user_prompt = (
         f"User question: {user_text}\n"
         f"Assistant answer: {assistant_text}\n"
         f"Sycophancy score: {sycophancy}\n"
         f"PII score: {pii}\n"
-        "Generate one optimal replacement prompt to fix the issues."
+        "Generate one optimized user prompt that will steer the next assistant response to be neutral, factual, and non-sycophantic.\n"
+        "Remember: output format must be exactly 'OPTIMIZED_PROMPT: ...'"
     )
     return [
         {"role": "system", "content": system_prompt},
@@ -97,15 +92,17 @@ def _generate_with_backboard_native(client: httpx.Client, api_url: str, api_key:
 
     system_prompt = (
         "You are a prompt optimization specialist for AI safety. "
-        "Generate one improved prompt that reduces sycophancy and PII risk. "
-        "Return plain text only."
+        "Generate exactly one optimized user prompt only. "
+        "Do NOT answer the original question and do NOT include rewritten assistant response. "
+        "Return ONLY in this exact format: OPTIMIZED_PROMPT: <single prompt sentence or short paragraph>."
     )
     user_prompt = (
         f"User question: {user_text}\n"
         f"Assistant answer: {assistant_text}\n"
         f"Sycophancy score: {sycophancy}\n"
         f"PII score: {pii}\n"
-        "Generate one optimal replacement prompt to fix the issues."
+        "Generate one optimized user prompt that reduces sycophancy and PII risk.\n"
+        "Remember: output format must be exactly 'OPTIMIZED_PROMPT: ...'"
     )
 
     assistant_resp = client.post(
@@ -144,6 +141,47 @@ def _generate_with_backboard_native(client: httpx.Client, api_url: str, api_key:
     return None
 
 
+def sanitize_optimized_prompt(raw_text: str) -> Optional[str]:
+    if not raw_text:
+        return None
+
+    text = raw_text.strip()
+
+    # Prefer strict tagged format.
+    tagged = re.search(r"optimized[_\s-]*prompt\s*:\s*(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
+    if tagged:
+        text = tagged.group(1).strip()
+
+    # Remove common wrappers and labels.
+    text = re.sub(r"^\s*(?:optimized\s*prompt|suggested\s*prompt|better\s*prompt)\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:assistant\s*answer|rewritten\s*reply|improved\s*response)\s*:[\s\S]*$", "", text, flags=re.IGNORECASE)
+
+    # Remove explicit context lines that are not prompt text.
+    filtered = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^(user\s*question|assistant\s*answer|sycophancy\s*score|pii\s*score|example)\s*:", stripped, flags=re.IGNORECASE):
+            continue
+        filtered.append(stripped)
+
+    cleaned = " ".join(filtered).strip()
+
+    # Reject answer-like outputs that start with direct response wording.
+    if re.match(r"^(yes|no|absolutely|certainly|honestly|here are|let me|it'?s|reflective|reflectiveness|you are|i can)\b", cleaned, flags=re.IGNORECASE):
+        return None
+
+    # Require prompt-like directive language.
+    if not re.search(r"\b(answer|respond|provide|explain|avoid|use|focus|be|do not|don't|keep|includ(?:e|ing))\b", cleaned, flags=re.IGNORECASE):
+        return None
+
+    if len(cleaned) < 20:
+        return None
+
+    return cleaned
+
+
 def generate_better_prompt(user_text: str, assistant_text: str, sycophancy: float, pii: float) -> tuple[str, str]:
     api_url = os.getenv("BACKBOARD_API_URL", "").strip()
     api_key = os.getenv("BACKBOARD_API_KEY", "").strip()
@@ -151,7 +189,7 @@ def generate_better_prompt(user_text: str, assistant_text: str, sycophancy: floa
     mode = os.getenv("BACKBOARD_MODE", "auto").strip().lower()
 
     if not api_url or not api_key:
-        return fallback_prompt(sycophancy, pii), "fallback"
+        return fallback_prompt(user_text, sycophancy, pii), "fallback"
 
     try:
         with httpx.Client(timeout=25.0) as client:
@@ -161,7 +199,9 @@ def generate_better_prompt(user_text: str, assistant_text: str, sycophancy: floa
                         client, api_url, api_key, model, user_text, assistant_text, sycophancy, pii
                     )
                     if content:
-                        return content, "backboard-openai"
+                        cleaned = sanitize_optimized_prompt(content)
+                        if cleaned:
+                            return cleaned, "backboard-openai"
                 except Exception:
                     if mode == "openai":
                         raise
@@ -171,11 +211,13 @@ def generate_better_prompt(user_text: str, assistant_text: str, sycophancy: floa
                     client, api_url, api_key, model, user_text, assistant_text, sycophancy, pii
                 )
                 if content:
-                    return content, "backboard-native"
+                    cleaned = sanitize_optimized_prompt(content)
+                    if cleaned:
+                        return cleaned, "backboard-native"
     except Exception:
         pass
 
-    return fallback_prompt(sycophancy, pii), "fallback"
+    return fallback_prompt(user_text, sycophancy, pii), "fallback"
 
 
 def build_factcheck_messages(user_text: str, assistant_text: str) -> list[dict]:

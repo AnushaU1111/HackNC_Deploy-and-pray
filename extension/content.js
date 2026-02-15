@@ -254,12 +254,65 @@ function escapeHtml(unsafe) {
 }
 
 function generatePromptFromSuggestion(suggestion) {
-  // Stronger template: ask the LLM to act as a senior prompt engineer
-  // that outputs a concise user prompt (to paste into the chat) and a
-  // rewritten assistant reply that avoids sycophancy and any PII requests.
-  const example = String(suggestion || "").trim();
-  const prompt = `You are a senior prompt engineer. Your goal is to produce two concise artifacts (and nothing else):\n1) a rewritten assistant reply that is neutral, concise, does NOT use excessive agreement, flattery, or emotional anchoring, and REFUSES or AVOIDS requesting any PII (email, phone, account numbers, OTPs, PINs, etc.);\n2) a short user prompt that a person can paste to the chat to obtain such a neutral reply from an assistant.\n\nRespond in JSON only with two fields exactly: {"rewritten_reply": "...", "user_prompt": "..."}. Do not include any extra commentary or explanation.\n\nExample assistant reply to rewrite:\n"""\n${example}\n"""\n\nNow produce the JSON output.`;
-  return prompt;
+  const raw = String(suggestion || "").trim();
+  if (!raw) return "";
+
+  const cleanupPromptText = (value) => {
+    if (!value) return "";
+    let cleaned = String(value).trim();
+    cleaned = cleaned.replace(/^\s*(?:optimized\s*question|user\s*prompt|prompt)\s*:\s*/i, "");
+    cleaned = cleaned.replace(/\s*(?:assistant\s*answer|rewritten\s*reply|improved\s*response)\s*:[\s\S]*$/i, "");
+    cleaned = cleaned.replace(/\s{2,}/g, " ").trim();
+    return cleaned;
+  };
+
+  const extractJsonObject = (text) => {
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      const match = text.match(/\{[\s\S]*\}/);
+      if (!match) return null;
+      try {
+        return JSON.parse(match[0]);
+      } catch (_) {
+        return null;
+      }
+    }
+  };
+
+  const maybeJson = extractJsonObject(raw);
+  if (maybeJson && typeof maybeJson === "object") {
+    if (typeof maybeJson.user_prompt === "string" && maybeJson.user_prompt.trim()) {
+      return cleanupPromptText(maybeJson.user_prompt);
+    }
+    if (typeof maybeJson.optimized_question === "string" && maybeJson.optimized_question.trim()) {
+      return cleanupPromptText(maybeJson.optimized_question);
+    }
+    if (typeof maybeJson.prompt === "string" && maybeJson.prompt.trim()) {
+      return cleanupPromptText(maybeJson.prompt);
+    }
+  }
+
+  const mixedQuestion = raw.match(/user\s*question\s*:\s*([\s\S]*?)(?:assistant\s*answer\s*:|$)/i);
+  if (mixedQuestion && mixedQuestion[1] && mixedQuestion[1].trim()) {
+    return cleanupPromptText(mixedQuestion[1]);
+  }
+
+  const labeledLine = raw.match(/(?:^|\n)\s*(?:user\s*prompt|optimized\s*question|question)\s*:\s*([^\n]+)/i);
+  if (labeledLine && labeledLine[1] && labeledLine[1].trim()) {
+    return cleanupPromptText(labeledLine[1]);
+  }
+
+  if (/^you are a senior prompt engineer/i.test(raw) || /respond in json only/i.test(raw)) {
+    return "Please provide a neutral, factual answer to my previous question without flattery, emotional overstatement, or unnecessary agreement.";
+  }
+
+  const cleanedRaw = cleanupPromptText(raw);
+  if (/^(yes|no|absolutely|honestly|reflective|reflectiveness|you are|it'?s)\b/i.test(cleanedRaw)) {
+    return "Answer my previous question in a neutral, evidence-based tone. Do not use flattery or excessive agreement. Acknowledge uncertainty where needed and keep the response concise and factual.";
+  }
+
+  return cleanedRaw;
 }
 
 function insertPromptToInput(text) {
@@ -320,7 +373,18 @@ const PANEL_STORAGE_KEY = "sycophancy-panel-layout-v1";
 function loadPanelLayout() {
   try {
     const raw = localStorage.getItem(PANEL_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+
+    const isSafeCssValue = (value) => typeof value === "string" && /^-?\d+(?:\.\d+)?px$/.test(value);
+
+    return {
+      top: isSafeCssValue(parsed.top) ? parsed.top : "",
+      left: isSafeCssValue(parsed.left) ? parsed.left : "",
+      width: isSafeCssValue(parsed.width) ? parsed.width : "",
+      height: isSafeCssValue(parsed.height) ? parsed.height : ""
+    };
   } catch (e) {
     return null;
   }
@@ -395,7 +459,58 @@ function enablePanelResizePersistence(panel) {
   panel.addEventListener("pointerup", () => savePanelLayout(panel));
 }
 
+function ensurePanelInViewport(panel) {
+  const minVisible = 80;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  const rect = panel.getBoundingClientRect();
+
+  let nextLeft = rect.left;
+  let nextTop = rect.top;
+
+  if (rect.right < minVisible) {
+    nextLeft = 16 - rect.width;
+  }
+  if (rect.left > vw - minVisible) {
+    nextLeft = vw - minVisible;
+  }
+  if (rect.bottom < minVisible) {
+    nextTop = 16 - rect.height;
+  }
+  if (rect.top > vh - minVisible) {
+    nextTop = vh - minVisible;
+  }
+
+  nextLeft = Math.max(0, Math.min(nextLeft, Math.max(0, vw - minVisible)));
+  nextTop = Math.max(0, Math.min(nextTop, Math.max(0, vh - minVisible)));
+
+  panel.style.left = `${nextLeft}px`;
+  panel.style.top = `${nextTop}px`;
+  panel.style.right = "auto";
+  panel.style.bottom = "auto";
+
+  const maxWidth = Math.max(240, vw - 24);
+  const maxHeight = Math.max(140, vh - 24);
+  if (rect.width > maxWidth) {
+    panel.style.width = `${maxWidth}px`;
+  }
+  if (rect.height > maxHeight) {
+    panel.style.height = `${maxHeight}px`;
+  }
+}
+
+let currentTab = "shield";
+let latestShieldResult = { sycophancy: 0, concessive: 0, emotional: 0, pii: 0 };
+let latestFactResult = null;
+let factCheckLoading = false;
+
 function injectPanel(result) {
+  if (result) {
+    latestShieldResult = result;
+  }
+  const activeResult = latestShieldResult;
+
   let panel = document.getElementById("sycophancy-panel");
 
   if (!panel) {
@@ -435,28 +550,77 @@ function injectPanel(result) {
       }
     }
 
+    ensurePanelInViewport(panel);
+
     enablePanelMove(panel);
     enablePanelResizePersistence(panel);
+
+    window.addEventListener("resize", () => {
+      ensurePanelInViewport(panel);
+      savePanelLayout(panel);
+    });
   }
 
   // Color coding based on score
   let color = "#4CAF50"; // green
-  if (result.sycophancy >= 70) color = "#f44336"; // red
-  else if (result.sycophancy >= 40) color = "#FFC107"; // yellow
+  if (activeResult.sycophancy >= 70) color = "#f44336"; // red
+  else if (activeResult.sycophancy >= 40) color = "#FFC107"; // yellow
 
-  const isHighPii = Number(result.pii) > 70;
+  const isHighPii = Number(activeResult.pii) > 70;
   const piiLineStyle = isHighPii ? 'color: #f44336; font-weight: 700;' : '';
 
   panel.style.border = `2px solid ${color}`;
 
-  panel.innerHTML = `
-    <div id="sycophancy-drag-handle" style="cursor:move; user-select:none; font-weight:700; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.15); padding-bottom:8px;">🛡 Sycophancy Shield</div>
-    Sycophancy Score: <b>${result.sycophancy}</b><br>
-    Concessive Agreement: <b>${result.concessive}</b><br>
-    Emotional Anchoring: <b>${result.emotional}</b><br>
-    <span style="${piiLineStyle}">PII Risk: <b>${result.pii}</b></span>
-    ${result.betterPrompt ? `<br><br><strong>Suggested Prompt</strong><br><div id="sycophancy-better-prompt" style="white-space:pre-wrap;">${escapeHtml(generatePromptFromSuggestion(result.betterPrompt))}</div><br><button id="sycophancy-accept-btn" style="margin-top:6px;padding:6px 8px;border-radius:6px;border:0;background:#2e7d32;color:#fff;cursor:pointer;margin-right:6px;">Accept</button><button id="sycophancy-deny-btn" style="margin-top:6px;padding:6px 8px;border-radius:6px;border:0;background:#9e9e9e;color:#fff;cursor:pointer;">Deny</button>` : ""}
+  const shieldTabStyle = currentTab === "shield"
+    ? "background:#2e7d32;color:#fff;border:0;"
+    : "background:#2b2b2b;color:#ddd;border:1px solid #444;";
+  const factTabStyle = currentTab === "fact"
+    ? "background:#1565c0;color:#fff;border:0;"
+    : "background:#2b2b2b;color:#ddd;border:1px solid #444;";
+
+  const shieldContent = `
+    Sycophancy Score: <b>${activeResult.sycophancy}</b><br>
+    Concessive Agreement: <b>${activeResult.concessive}</b><br>
+    Emotional Anchoring: <b>${activeResult.emotional}</b><br>
+    <span style="${piiLineStyle}">PII Risk: <b>${activeResult.pii}</b></span>
+    ${activeResult.betterPrompt ? `<br><br><strong>Suggested Prompt</strong><br><div id="sycophancy-better-prompt" style="white-space:pre-wrap;">${escapeHtml(generatePromptFromSuggestion(activeResult.betterPrompt))}</div><br><button id="sycophancy-accept-btn" style="margin-top:6px;padding:6px 8px;border-radius:6px;border:0;background:#2e7d32;color:#fff;cursor:pointer;margin-right:6px;">Accept</button><button id="sycophancy-deny-btn" style="margin-top:6px;padding:6px 8px;border-radius:6px;border:0;background:#9e9e9e;color:#fff;cursor:pointer;">Deny</button>` : ""}
   `;
+
+  const factContent = factCheckLoading
+    ? `<strong>Fact Checker</strong><br><br>Evaluating response accuracy...`
+    : latestFactResult
+      ? `<strong>Fact Checker</strong><br><br>
+          Accuracy Score: <b>${latestFactResult.accuracy_score}</b><br>
+          Verdict: <b>${escapeHtml(latestFactResult.verdict)}</b><br>
+          Source: <b>${escapeHtml(latestFactResult.source || "unknown")}</b><br><br>
+          <span>${escapeHtml(latestFactResult.explanation || "No explanation provided.")}</span>`
+      : `<strong>Fact Checker</strong><br><br>No fact-check result yet.`;
+
+  panel.innerHTML = `
+    <div id="sycophancy-drag-handle" style="cursor:move; user-select:none; font-weight:700; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.15); padding-bottom:8px;">🛡 CogniShield</div>
+    <div style="display:flex; gap:8px; margin-bottom:10px;">
+      <button id="tab-shield" style="padding:6px 10px;border-radius:8px;cursor:pointer;${shieldTabStyle}">Shield</button>
+      <button id="tab-fact" style="padding:6px 10px;border-radius:8px;cursor:pointer;${factTabStyle}">Fact Checker</button>
+    </div>
+    ${currentTab === "shield" ? shieldContent : factContent}
+  `;
+
+  const shieldTabButton = panel.querySelector('#tab-shield');
+  const factTabButton = panel.querySelector('#tab-fact');
+
+  if (shieldTabButton) {
+    shieldTabButton.addEventListener('click', () => {
+      currentTab = "shield";
+      injectPanel();
+    });
+  }
+  if (factTabButton) {
+    factTabButton.addEventListener('click', () => {
+      currentTab = "fact";
+      injectPanel();
+    });
+  }
+
   // Attach accept/deny handlers
   const acceptBtn = panel.querySelector('#sycophancy-accept-btn');
   const denyBtn = panel.querySelector('#sycophancy-deny-btn');
@@ -484,6 +648,13 @@ function injectPanel(result) {
       denyBtn.textContent = 'Dismissed';
       setTimeout(() => (denyBtn.textContent = 'Deny'), 800);
     });
+  }
+}
+
+function ensurePanelMounted() {
+  const existing = document.getElementById("sycophancy-panel");
+  if (!existing) {
+    injectPanel();
   }
 }
 
@@ -520,43 +691,85 @@ function sendToBackend(userText, assistantText, scores, callback) {
   );
 }
 
+function sendFactCheckToBackend(userText, assistantText, callback) {
+  chrome.runtime.sendMessage(
+    {
+      type: "FACT_CHECK",
+      payload: {
+        user: userText,
+        ai: assistantText
+      }
+    },
+    (response) => {
+      if (chrome.runtime.lastError) {
+        console.log("Fact-check communication error:", chrome.runtime.lastError.message);
+        return;
+      }
+
+      if (response && response.success) {
+        if (callback) callback(response.data);
+      } else if (response && response.error) {
+        console.log("Fact-check backend error:", response.error);
+      }
+    }
+  );
+}
+
 // ====== OBSERVER FOR REAL-TIME UPDATES ======
 const chatContainer = document.querySelector("main") || document.body;
 let lastProcessedPair = "";
 
+function processLatestConversation(force = false) {
+  const msgs = getMessages();
+  if (!msgs) return;
+
+  const pairKey = `${msgs.user}\n---\n${msgs.assistant}`;
+  if (!force && pairKey === lastProcessedPair) return;
+  lastProcessedPair = pairKey;
+
+  let result;
+  try {
+    result = computeSycophancyScore(msgs.user, msgs.assistant);
+  } catch (e) {
+    console.error('[Sycophancy] compute error:', e);
+    result = { sycophancy: 0, concessive: 0, emotional: 0, pii: 0 };
+  }
+
+  injectPanel(result);
+
+  factCheckLoading = true;
+  if (currentTab === "fact") injectPanel();
+
+  try {
+    sendToBackend(msgs.user, msgs.assistant, result, (backendData) => {
+      if (!backendData) return;
+      if (backendData.better_prompt) {
+        injectPanel({
+          ...result,
+          betterPrompt: backendData.better_prompt
+        });
+      }
+    });
+  } catch (e) {
+    console.error('[Sycophancy] sendToBackend error:', e);
+  }
+
+  try {
+    sendFactCheckToBackend(msgs.user, msgs.assistant, (factData) => {
+      if (!factData) return;
+      latestFactResult = factData;
+      factCheckLoading = false;
+      injectPanel();
+    });
+  } catch (e) {
+    factCheckLoading = false;
+    console.error('[Sycophancy] factcheck error:', e);
+  }
+}
+
 const observer = new MutationObserver(() => {
   try {
-    const msgs = getMessages();
-    if (!msgs) return;
-
-    const pairKey = `${msgs.user}\n---\n${msgs.assistant}`;
-    if (pairKey === lastProcessedPair) return;
-    lastProcessedPair = pairKey;
-
-    let result;
-    try {
-      result = computeSycophancyScore(msgs.user, msgs.assistant);
-    } catch (e) {
-      console.error('[Sycophancy] compute error:', e);
-      result = { sycophancy: 0, concessive: 0, emotional: 0, pii: 0 };
-    }
-
-    injectPanel(result);
-    
-    // Send to backend (guard errors)
-    try {
-      sendToBackend(msgs.user, msgs.assistant, result, (backendData) => {
-        if (!backendData) return;
-        if (backendData.better_prompt) {
-          injectPanel({
-            ...result,
-            betterPrompt: backendData.better_prompt
-          });
-        }
-      });
-    } catch (e) {
-      console.error('[Sycophancy] sendToBackend error:', e);
-    }
+    processLatestConversation(false);
   } catch (e) {
     console.error('[Sycophancy] observer error:', e);
   }
@@ -566,6 +779,31 @@ observer.observe(chatContainer, { childList: true, subtree: true });
 
 // ====== INITIAL PANEL ======
 injectPanel({ sycophancy: 0, concessive: 0, emotional: 0, pii: 0 });
+processLatestConversation(true);
+
+// Keep panel alive across SPA rerenders/navigation refreshes
+setInterval(ensurePanelMounted, 1500);
+setInterval(() => {
+  try {
+    processLatestConversation(false);
+  } catch (e) {
+    console.error('[Sycophancy] polling error:', e);
+  }
+}, 2000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    ensurePanelMounted();
+    processLatestConversation(false);
+  }
+});
+window.addEventListener("popstate", () => {
+  ensurePanelMounted();
+  processLatestConversation(false);
+});
+window.addEventListener("hashchange", () => {
+  ensurePanelMounted();
+  processLatestConversation(false);
+});
 
 // Expose helper for manual testing in the console
 try {
