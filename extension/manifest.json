@@ -3,14 +3,25 @@
   "name": "Sycophancy Shield",
   "version": "1.0",
   "description": "Flags deceptive or sycophantic AI behavior locally.",
-  "permissions": ["activeTab"],
+  "permissions": [
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": [
         "https://chat.openai.com/*",
         "https://chatgpt.com/*"
       ],
-      "js": ["content.js"]
+      "js": [
+        "content.js"
+      ]
     }
   ]
 }

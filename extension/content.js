@@ -221,6 +221,32 @@ function injectPanel(result) {
   `;
 }
 
+// ====== BACKEND INTEGRATION ======
+function sendToBackend(userText, assistantText, scores) {
+  // Send to backend via background script
+  chrome.runtime.sendMessage(
+    {
+      type: "ANALYZE_TEXT",
+      payload: {
+        user: userText,
+        ai: assistantText
+      }
+    },
+    (response) => {
+      if (chrome.runtime.lastError) {
+        console.log("Backend communication error:", chrome.runtime.lastError.message);
+        return;
+      }
+      
+      if (response && response.success) {
+        console.log("Backend response:", response.data);
+      } else if (response && response.error) {
+        console.log("Backend error:", response.error);
+      }
+    }
+  );
+}
+
 // ====== OBSERVER FOR REAL-TIME UPDATES ======
 const chatContainer = document.querySelector("main") || document.body;
 
@@ -230,6 +256,9 @@ const observer = new MutationObserver(() => {
 
   const result = computeSycophancyScore(msgs.user, msgs.assistant);
   injectPanel(result);
+  
+  // Send to backend
+  sendToBackend(msgs.user, msgs.assistant, result);
 });
 
 observer.observe(chatContainer, { childList: true, subtree: true });
