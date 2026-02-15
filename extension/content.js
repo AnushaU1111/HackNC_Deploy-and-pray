@@ -315,6 +315,86 @@ function insertPromptToInput(text) {
   return false;
 }
 
+const PANEL_STORAGE_KEY = "sycophancy-panel-layout-v1";
+
+function loadPanelLayout() {
+  try {
+    const raw = localStorage.getItem(PANEL_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function savePanelLayout(panel) {
+  try {
+    const layout = {
+      top: panel.style.top || "",
+      left: panel.style.left || "",
+      width: panel.style.width || "",
+      height: panel.style.height || ""
+    };
+    localStorage.setItem(PANEL_STORAGE_KEY, JSON.stringify(layout));
+  } catch (e) {
+    // ignore storage errors
+  }
+}
+
+function enablePanelMove(panel) {
+  if (panel.dataset.moveBound === "true") return;
+  panel.dataset.moveBound = "true";
+
+  let isDragging = false;
+  let startX = 0;
+  let startY = 0;
+  let startLeft = 0;
+  let startTop = 0;
+
+  const onPointerMove = (event) => {
+    if (!isDragging) return;
+    const nextLeft = startLeft + (event.clientX - startX);
+    const nextTop = startTop + (event.clientY - startY);
+    panel.style.left = `${Math.max(0, nextLeft)}px`;
+    panel.style.top = `${Math.max(0, nextTop)}px`;
+  };
+
+  const onPointerUp = () => {
+    if (!isDragging) return;
+    isDragging = false;
+    document.removeEventListener("pointermove", onPointerMove);
+    document.removeEventListener("pointerup", onPointerUp);
+    savePanelLayout(panel);
+  };
+
+  panel.addEventListener("pointerdown", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (!target.closest("#sycophancy-drag-handle")) return;
+
+    const rect = panel.getBoundingClientRect();
+    panel.style.bottom = "auto";
+    panel.style.right = "auto";
+    panel.style.left = `${rect.left}px`;
+    panel.style.top = `${rect.top}px`;
+
+    isDragging = true;
+    startX = event.clientX;
+    startY = event.clientY;
+    startLeft = rect.left;
+    startTop = rect.top;
+
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+    event.preventDefault();
+  });
+}
+
+function enablePanelResizePersistence(panel) {
+  if (panel.dataset.resizeBound === "true") return;
+  panel.dataset.resizeBound = "true";
+  panel.addEventListener("pointerup", () => savePanelLayout(panel));
+}
+
 function injectPanel(result) {
   let panel = document.getElementById("sycophancy-panel");
 
@@ -326,6 +406,12 @@ function injectPanel(result) {
     panel.style.bottom = "20px";
     panel.style.right = "20px";
     panel.style.width = "280px";
+    panel.style.minWidth = "240px";
+    panel.style.minHeight = "140px";
+    panel.style.maxWidth = "90vw";
+    panel.style.maxHeight = "80vh";
+    panel.style.resize = "both";
+    panel.style.overflow = "auto";
     panel.style.padding = "15px";
     panel.style.background = "#111";
     panel.style.color = "#fff";
@@ -336,6 +422,21 @@ function injectPanel(result) {
     panel.style.fontFamily = "Arial, sans-serif";
 
     document.body.appendChild(panel);
+
+    const savedLayout = loadPanelLayout();
+    if (savedLayout) {
+      if (savedLayout.width) panel.style.width = savedLayout.width;
+      if (savedLayout.height) panel.style.height = savedLayout.height;
+      if (savedLayout.left && savedLayout.top) {
+        panel.style.left = savedLayout.left;
+        panel.style.top = savedLayout.top;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      }
+    }
+
+    enablePanelMove(panel);
+    enablePanelResizePersistence(panel);
   }
 
   // Color coding based on score
@@ -349,7 +450,7 @@ function injectPanel(result) {
   panel.style.border = `2px solid ${color}`;
 
   panel.innerHTML = `
-    <strong>🛡 Sycophancy Shield</strong><br><br>
+    <div id="sycophancy-drag-handle" style="cursor:move; user-select:none; font-weight:700; margin-bottom:10px; border-bottom:1px solid rgba(255,255,255,0.15); padding-bottom:8px;">🛡 Sycophancy Shield</div>
     Sycophancy Score: <b>${result.sycophancy}</b><br>
     Concessive Agreement: <b>${result.concessive}</b><br>
     Emotional Anchoring: <b>${result.emotional}</b><br>
