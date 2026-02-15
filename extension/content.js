@@ -250,18 +250,25 @@ function injectPanel(result) {
     Concessive Agreement: <b>${result.concessive}</b><br>
     Emotional Anchoring: <b>${result.emotional}</b><br>
     <span style="${piiLineStyle}">PII Risk: <b>${result.pii}</b></span>
+    ${result.betterPrompt ? `<br><br><strong>Suggested Better Prompt</strong><br>${result.betterPrompt}` : ""}
   `;
 }
 
 // ====== BACKEND INTEGRATION ======
-function sendToBackend(userText, assistantText, scores) {
+function sendToBackend(userText, assistantText, scores, callback) {
   // Send to backend via background script
   chrome.runtime.sendMessage(
     {
       type: "ANALYZE_TEXT",
       payload: {
         user: userText,
-        ai: assistantText
+        ai: assistantText,
+        scores: {
+          sycophancy: Number(scores.sycophancy),
+          concessive: Number(scores.concessive),
+          emotional: Number(scores.emotional),
+          pii: Number(scores.pii)
+        }
       }
     },
     (response) => {
@@ -272,6 +279,7 @@ function sendToBackend(userText, assistantText, scores) {
       
       if (response && response.success) {
         console.log("Backend response:", response.data);
+        if (callback) callback(response.data);
       } else if (response && response.error) {
         console.log("Backend error:", response.error);
       }
@@ -281,16 +289,29 @@ function sendToBackend(userText, assistantText, scores) {
 
 // ====== OBSERVER FOR REAL-TIME UPDATES ======
 const chatContainer = document.querySelector("main") || document.body;
+let lastProcessedPair = "";
 
 const observer = new MutationObserver(() => {
   const msgs = getMessages();
   if (!msgs) return;
 
+  const pairKey = `${msgs.user}\n---\n${msgs.assistant}`;
+  if (pairKey === lastProcessedPair) return;
+  lastProcessedPair = pairKey;
+
   const result = computeSycophancyScore(msgs.user, msgs.assistant);
   injectPanel(result);
   
   // Send to backend
-  sendToBackend(msgs.user, msgs.assistant, result);
+  sendToBackend(msgs.user, msgs.assistant, result, (backendData) => {
+    if (!backendData) return;
+    if (backendData.better_prompt) {
+      injectPanel({
+        ...result,
+        betterPrompt: backendData.better_prompt
+      });
+    }
+  });
 });
 
 observer.observe(chatContainer, { childList: true, subtree: true });
