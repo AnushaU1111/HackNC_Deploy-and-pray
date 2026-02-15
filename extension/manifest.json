@@ -1,29 +1,16 @@
 {
-    "manifest_version": 3,
-    "name": "HackNC Sycophancy Shield",
-    "version": "1.0",
-    "permissions": [
-        "storage"
-    ],
-    "host_permissions": [
-        "http://localhost:8000/*"
-    ],
-    "background": {
-        "service_worker": "background.js"
-    },
-    "content_scripts": [
-        {
-            "matches": [
-                "https://chatgpt.com/*",
-                "https://claude.ai/*"
-            ],
-            "js": [
-                "content.js",
-                "inject_ui.js"
-            ],
-            "css": [
-                "styles.css"
-            ]
-        }
-    ]
+  "manifest_version": 3,
+  "name": "Sycophancy Shield",
+  "version": "1.0",
+  "description": "Flags deceptive or sycophantic AI behavior locally.",
+  "permissions": ["activeTab"],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*"
+      ],
+      "js": ["content.js"]
+    }
+  ]
 }
