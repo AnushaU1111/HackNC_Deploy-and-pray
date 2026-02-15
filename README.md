@@ -1,5 +1,5 @@
 # 🛡 CogniShield : Where AI Confidence Meets Accountability.
-##An AI Integrity Layer for Flattery Detection, Prompt Guidance & Real-Time Fact Verification.
+## An AI Integrity Layer for Flattery Detection, Prompt Guidance & Real-Time Fact Verification.
 
 ## The Problem
 
