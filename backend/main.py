@@ -5,6 +5,8 @@ from pydantic import BaseModel
 from typing import Optional
 import os
 import httpx
+import json
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,6 +25,11 @@ class AnalyzeRequest(BaseModel):
     user: str
     ai: str
     scores: Optional[dict] = None
+
+
+class FactCheckRequest(BaseModel):
+    user: str
+    ai: str
 
 
 def fallback_prompt(sycophancy: float, pii: float) -> str:
@@ -170,6 +177,183 @@ def generate_better_prompt(user_text: str, assistant_text: str, sycophancy: floa
 
     return fallback_prompt(sycophancy, pii), "fallback"
 
+
+def build_factcheck_messages(user_text: str, assistant_text: str) -> list[dict]:
+    system_prompt = (
+        "You are a strict factuality evaluator. "
+        "Assess the assistant answer for factual accuracy against generally known facts and internal consistency. "
+        "Return JSON only with keys: accuracy_score (0-100 integer), verdict (accurate|mostly_accurate|mixed|inaccurate|uncertain), explanation (short string)."
+    )
+    user_prompt = (
+        f"User question: {user_text}\n"
+        f"Assistant answer: {assistant_text}\n"
+        "Return JSON only."
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _parse_factcheck_json(raw_text: str) -> Optional[dict]:
+    if not raw_text:
+        return None
+
+    candidate = raw_text.strip()
+    try:
+        data = json.loads(candidate)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", candidate)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    accuracy_score = data.get("accuracy_score")
+    verdict = data.get("verdict")
+    explanation = data.get("explanation")
+
+    try:
+        accuracy_score = int(float(accuracy_score))
+    except Exception:
+        return None
+
+    if not isinstance(verdict, str) or not verdict.strip():
+        return None
+    if not isinstance(explanation, str) or not explanation.strip():
+        return None
+
+    return {
+        "accuracy_score": max(0, min(100, accuracy_score)),
+        "verdict": verdict.strip().lower(),
+        "explanation": explanation.strip(),
+    }
+
+
+def _factcheck_openai_compat(client: httpx.Client, api_url: str, api_key: str, model: str, user_text: str, assistant_text: str) -> Optional[dict]:
+    endpoint = f"{api_url.rstrip('/')}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": build_factcheck_messages(user_text, assistant_text),
+        "temperature": 0.0,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    response = client.post(endpoint, json=payload, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    return _parse_factcheck_json(content)
+
+
+def _factcheck_backboard_native(client: httpx.Client, api_url: str, api_key: str, model: str, user_text: str, assistant_text: str) -> Optional[dict]:
+    base_url = api_url.rstrip("/")
+    headers = {"X-API-Key": api_key}
+
+    system_prompt = (
+        "You are a strict factuality evaluator. Return JSON only with keys: "
+        "accuracy_score (0-100 integer), verdict (accurate|mostly_accurate|mixed|inaccurate|uncertain), explanation (short string)."
+    )
+    user_prompt = (
+        f"User question: {user_text}\n"
+        f"Assistant answer: {assistant_text}\n"
+        "Return JSON only."
+    )
+
+    assistant_resp = client.post(
+        f"{base_url}/assistants",
+        json={"name": "Shield Fact Checker", "system_prompt": system_prompt, "model": model},
+        headers=headers,
+    )
+    assistant_resp.raise_for_status()
+    assistant_id = assistant_resp.json().get("assistant_id")
+    if not assistant_id:
+        return None
+
+    thread_resp = client.post(
+        f"{base_url}/assistants/{assistant_id}/threads",
+        json={},
+        headers=headers,
+    )
+    thread_resp.raise_for_status()
+    thread_id = thread_resp.json().get("thread_id")
+    if not thread_id:
+        return None
+
+    msg_resp = client.post(
+        f"{base_url}/threads/{thread_id}/messages",
+        headers=headers,
+        data={"content": user_prompt, "stream": "false"},
+    )
+    msg_resp.raise_for_status()
+    msg_data = msg_resp.json()
+
+    text = ""
+    if isinstance(msg_data, dict):
+        if isinstance(msg_data.get("content"), str):
+            text = msg_data.get("content")
+        elif isinstance(msg_data.get("message"), str):
+            text = msg_data.get("message")
+
+    return _parse_factcheck_json(text)
+
+
+def fallback_factcheck(assistant_text: str) -> dict:
+    if not assistant_text or len(assistant_text.strip()) < 20:
+        return {
+            "accuracy_score": 40,
+            "verdict": "uncertain",
+            "explanation": "Insufficient detail to assess factual accuracy.",
+            "source": "fallback",
+        }
+
+    return {
+        "accuracy_score": 55,
+        "verdict": "uncertain",
+        "explanation": "Automated fact-check model unavailable; unable to verify claims confidently.",
+        "source": "fallback",
+    }
+
+
+def generate_factcheck(user_text: str, assistant_text: str) -> dict:
+    api_url = os.getenv("BACKBOARD_API_URL", "").strip()
+    api_key = os.getenv("BACKBOARD_API_KEY", "").strip()
+    model = os.getenv("BACKBOARD_MODEL", "gpt-4o-mini")
+    mode = os.getenv("BACKBOARD_MODE", "auto").strip().lower()
+
+    if not api_url or not api_key:
+        return fallback_factcheck(assistant_text)
+
+    try:
+        with httpx.Client(timeout=25.0) as client:
+            if mode in ("auto", "openai"):
+                try:
+                    result = _factcheck_openai_compat(client, api_url, api_key, model, user_text, assistant_text)
+                    if result:
+                        result["source"] = "backboard-openai"
+                        return result
+                except Exception:
+                    if mode == "openai":
+                        raise
+
+            if mode in ("auto", "native"):
+                result = _factcheck_backboard_native(client, api_url, api_key, model, user_text, assistant_text)
+                if result:
+                    result["source"] = "backboard-native"
+                    return result
+    except Exception:
+        pass
+
+    return fallback_factcheck(assistant_text)
+
 @app.post("/analyze")
 def analyze(request: AnalyzeRequest):
     scores = request.scores or {}
@@ -201,6 +385,17 @@ def analyze(request: AnalyzeRequest):
 
     return {
         **response
+    }
+
+
+@app.post("/factcheck")
+def factcheck(request: FactCheckRequest):
+    result = generate_factcheck(request.user, request.ai)
+    return {
+        "accuracy_score": result["accuracy_score"],
+        "verdict": result["verdict"],
+        "explanation": result["explanation"],
+        "source": result.get("source", "fallback"),
     }
 
 @app.get("/health")
