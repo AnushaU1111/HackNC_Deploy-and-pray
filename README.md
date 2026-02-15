@@ -1,7 +1,7 @@
 # HackNC_Deploy-and-pray
 
 ## Overview
-HackNC_Deploy-and-pray is a cutting-edge project designed to enhance online interactions by detecting sycophantic behavior and providing real-time feedback. This project combines a robust backend powered by FastAPI and a sleek Chrome extension frontend to deliver a seamless user experience.
+Cognishield is a cutting-edge project designed to enhance online interactions by detecting sycophantic behavior and providing real-time feedback. This project combines a robust backend powered by FastAPI and a sleek Chrome extension frontend to deliver a seamless user experience.
 
 ## Features
 - **Sycophancy Detection**: Analyze text for sycophantic behavior and receive a risk score with detailed reasoning.
